@@ -15,18 +15,16 @@
 package server
 
 import (
-	"compress/gzip"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/fatedier/frp/assets"
-	"github.com/fatedier/frp/models/config"
+	"github.com/fatedier/frp/g"
+	frpNet "github.com/fatedier/frp/utils/net"
 
-	"github.com/julienschmidt/httprouter"
+	"github.com/gorilla/mux"
 )
 
 var (
@@ -34,24 +32,26 @@ var (
 	httpServerWriteTimeout = 10 * time.Second
 )
 
-func RunDashboardServer(addr string, port int64) (err error) {
+func RunDashboardServer(addr string, port int) (err error) {
 	// url router
-	router := httprouter.New()
+	router := mux.NewRouter()
+
+	user, passwd := g.GlbServerCfg.DashboardUser, g.GlbServerCfg.DashboardPwd
+	router.Use(frpNet.NewHttpAuthMiddleware(user, passwd).Middleware)
 
 	// api, see dashboard_api.go
-	router.GET("/api/serverinfo", httprouterBasicAuth(apiServerInfo))
-	router.GET("/api/proxy/tcp", httprouterBasicAuth(apiProxyTcp))
-	router.GET("/api/proxy/udp", httprouterBasicAuth(apiProxyUdp))
-	router.GET("/api/proxy/http", httprouterBasicAuth(apiProxyHttp))
-	router.GET("/api/proxy/https", httprouterBasicAuth(apiProxyHttps))
-	router.GET("/api/proxy/traffic/:name", httprouterBasicAuth(apiProxyTraffic))
+	router.HandleFunc("/api/serverinfo", apiServerInfo).Methods("GET")
+	router.HandleFunc("/api/proxy/{type}", apiProxyByType).Methods("GET")
+	router.HandleFunc("/api/proxy/{type}/{name}", apiProxyByTypeAndName).Methods("GET")
+	router.HandleFunc("/api/traffic/{name}", apiProxyTraffic).Methods("GET")
 
 	// view
-	router.Handler("GET", "/favicon.ico", http.FileServer(assets.FileSystem))
-	router.Handler("GET", "/static/*filepath", MakeGzipHandler(basicAuthWraper(http.StripPrefix("/static/", http.FileServer(assets.FileSystem)))))
-	router.HandlerFunc("GET", "/", basicAuth(func(w http.ResponseWriter, r *http.Request) {
+	router.Handle("/favicon.ico", http.FileServer(assets.FileSystem)).Methods("GET")
+	router.PathPrefix("/static/").Handler(frpNet.MakeHttpGzipHandler(http.StripPrefix("/static/", http.FileServer(assets.FileSystem)))).Methods("GET")
+
+	router.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/static/", http.StatusMovedPermanently)
-	}))
+	})
 
 	address := fmt.Sprintf("%s:%d", addr, port)
 	server := &http.Server{
@@ -70,92 +70,4 @@ func RunDashboardServer(addr string, port int64) (err error) {
 
 	go server.Serve(ln)
 	return
-}
-
-func use(h http.HandlerFunc, middleware ...func(http.HandlerFunc) http.HandlerFunc) http.HandlerFunc {
-	for _, m := range middleware {
-		h = m(h)
-	}
-	return h
-}
-
-type AuthWraper struct {
-	h      http.Handler
-	user   string
-	passwd string
-}
-
-func (aw *AuthWraper) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	user, passwd, hasAuth := r.BasicAuth()
-	if (aw.user == "" && aw.passwd == "") || (hasAuth && user == aw.user && passwd == aw.passwd) {
-		aw.h.ServeHTTP(w, r)
-	} else {
-		w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
-		http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
-	}
-}
-
-func basicAuthWraper(h http.Handler) http.Handler {
-	return &AuthWraper{
-		h:      h,
-		user:   config.ServerCommonCfg.DashboardUser,
-		passwd: config.ServerCommonCfg.DashboardPwd,
-	}
-}
-
-func basicAuth(h http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		user, passwd, hasAuth := r.BasicAuth()
-		if (config.ServerCommonCfg.DashboardUser == "" && config.ServerCommonCfg.DashboardPwd == "") ||
-			(hasAuth && user == config.ServerCommonCfg.DashboardUser && passwd == config.ServerCommonCfg.DashboardPwd) {
-			h.ServeHTTP(w, r)
-		} else {
-			w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
-			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
-		}
-	}
-}
-
-func httprouterBasicAuth(h httprouter.Handle) httprouter.Handle {
-	return func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-		user, passwd, hasAuth := r.BasicAuth()
-		if (config.ServerCommonCfg.DashboardUser == "" && config.ServerCommonCfg.DashboardPwd == "") ||
-			(hasAuth && user == config.ServerCommonCfg.DashboardUser && passwd == config.ServerCommonCfg.DashboardPwd) {
-			h(w, r, ps)
-		} else {
-			w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
-			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
-		}
-	}
-}
-
-type GzipWraper struct {
-	h http.Handler
-}
-
-func (gw *GzipWraper) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
-		gw.h.ServeHTTP(w, r)
-		return
-	}
-	w.Header().Set("Content-Encoding", "gzip")
-	gz := gzip.NewWriter(w)
-	defer gz.Close()
-	gzr := gzipResponseWriter{Writer: gz, ResponseWriter: w}
-	gw.h.ServeHTTP(gzr, r)
-}
-
-func MakeGzipHandler(h http.Handler) http.Handler {
-	return &GzipWraper{
-		h: h,
-	}
-}
-
-type gzipResponseWriter struct {
-	io.Writer
-	http.ResponseWriter
-}
-
-func (w gzipResponseWriter) Write(b []byte) (int, error) {
-	return w.Writer.Write(b)
 }

@@ -17,17 +17,21 @@ package server
 import (
 	"fmt"
 	"io"
+	"runtime/debug"
 	"sync"
 	"time"
 
+	"github.com/fatedier/frp/g"
 	"github.com/fatedier/frp/models/config"
 	"github.com/fatedier/frp/models/consts"
+	frpErr "github.com/fatedier/frp/models/errors"
 	"github.com/fatedier/frp/models/msg"
-	"github.com/fatedier/frp/utils/crypto"
-	"github.com/fatedier/frp/utils/errors"
 	"github.com/fatedier/frp/utils/net"
-	"github.com/fatedier/frp/utils/shutdown"
 	"github.com/fatedier/frp/utils/version"
+
+	"github.com/fatedier/golib/control/shutdown"
+	"github.com/fatedier/golib/crypto"
+	"github.com/fatedier/golib/errors"
 )
 
 type Control struct {
@@ -50,10 +54,13 @@ type Control struct {
 	workConnCh chan net.Conn
 
 	// proxies in one client
-	proxies []Proxy
+	proxies map[string]Proxy
 
 	// pool count
 	poolCount int
+
+	// ports used, for limitations
+	portsUsedNum int
 
 	// last time got the Ping message
 	lastPing time.Time
@@ -82,8 +89,9 @@ func NewControl(svr *Service, ctlConn net.Conn, loginMsg *msg.Login) *Control {
 		sendCh:          make(chan msg.Message, 10),
 		readCh:          make(chan msg.Message, 10),
 		workConnCh:      make(chan net.Conn, loginMsg.PoolCount+10),
-		proxies:         make([]Proxy, 0),
+		proxies:         make(map[string]Proxy),
 		poolCount:       loginMsg.PoolCount,
+		portsUsedNum:    0,
 		lastPing:        time.Now(),
 		runId:           loginMsg.RunId,
 		status:          consts.Working,
@@ -97,9 +105,10 @@ func NewControl(svr *Service, ctlConn net.Conn, loginMsg *msg.Login) *Control {
 // Start send a login success message to client and start working.
 func (ctl *Control) Start() {
 	loginRespMsg := &msg.LoginResp{
-		Version: version.Full(),
-		RunId:   ctl.runId,
-		Error:   "",
+		Version:       version.Full(),
+		RunId:         ctl.runId,
+		ServerUdpPort: g.GlbServerCfg.BindUdpPort,
+		Error:         "",
 	}
 	msg.WriteMsg(ctl.conn, loginRespMsg)
 
@@ -117,6 +126,7 @@ func (ctl *Control) RegisterWorkConn(conn net.Conn) {
 	defer func() {
 		if err := recover(); err != nil {
 			ctl.conn.Error("panic error: %v", err)
+			ctl.conn.Error(string(debug.Stack()))
 		}
 	}()
 
@@ -137,6 +147,7 @@ func (ctl *Control) GetWorkConn() (workConn net.Conn, err error) {
 	defer func() {
 		if err := recover(); err != nil {
 			ctl.conn.Error("panic error: %v", err)
+			ctl.conn.Error(string(debug.Stack()))
 		}
 	}()
 
@@ -145,7 +156,7 @@ func (ctl *Control) GetWorkConn() (workConn net.Conn, err error) {
 	select {
 	case workConn, ok = <-ctl.workConnCh:
 		if !ok {
-			err = errors.ErrCtlClosed
+			err = frpErr.ErrCtlClosed
 			return
 		}
 		ctl.conn.Debug("get work connection from pool")
@@ -162,12 +173,12 @@ func (ctl *Control) GetWorkConn() (workConn net.Conn, err error) {
 		select {
 		case workConn, ok = <-ctl.workConnCh:
 			if !ok {
-				err = errors.ErrCtlClosed
+				err = frpErr.ErrCtlClosed
 				ctl.conn.Warn("no work connections avaiable, %v", err)
 				return
 			}
 
-		case <-time.After(time.Duration(config.ServerCommonCfg.UserConnTimeout) * time.Second):
+		case <-time.After(time.Duration(g.GlbServerCfg.UserConnTimeout) * time.Second):
 			err = fmt.Errorf("timeout trying to get work connection")
 			ctl.conn.Warn("%v", err)
 			return
@@ -191,13 +202,14 @@ func (ctl *Control) writer() {
 	defer func() {
 		if err := recover(); err != nil {
 			ctl.conn.Error("panic error: %v", err)
+			ctl.conn.Error(string(debug.Stack()))
 		}
 	}()
 
 	defer ctl.allShutdown.Start()
 	defer ctl.writerShutdown.Done()
 
-	encWriter, err := crypto.NewWriter(ctl.conn, []byte(config.ServerCommonCfg.PrivilegeToken))
+	encWriter, err := crypto.NewWriter(ctl.conn, []byte(g.GlbServerCfg.Token))
 	if err != nil {
 		ctl.conn.Error("crypto new writer error: %v", err)
 		ctl.allShutdown.Start()
@@ -220,13 +232,14 @@ func (ctl *Control) reader() {
 	defer func() {
 		if err := recover(); err != nil {
 			ctl.conn.Error("panic error: %v", err)
+			ctl.conn.Error(string(debug.Stack()))
 		}
 	}()
 
 	defer ctl.allShutdown.Start()
 	defer ctl.readerShutdown.Done()
 
-	encReader := crypto.NewReader(ctl.conn, []byte(config.ServerCommonCfg.PrivilegeToken))
+	encReader := crypto.NewReader(ctl.conn, []byte(g.GlbServerCfg.Token))
 	for {
 		if m, err := msg.ReadMsg(encReader); err != nil {
 			if err == io.EOF {
@@ -246,19 +259,23 @@ func (ctl *Control) stoper() {
 	defer func() {
 		if err := recover(); err != nil {
 			ctl.conn.Error("panic error: %v", err)
+			ctl.conn.Error(string(debug.Stack()))
 		}
 	}()
 
 	ctl.allShutdown.WaitStart()
 
 	close(ctl.readCh)
-	ctl.managerShutdown.WaitDown()
+	ctl.managerShutdown.WaitDone()
 
 	close(ctl.sendCh)
-	ctl.writerShutdown.WaitDown()
+	ctl.writerShutdown.WaitDone()
 
 	ctl.conn.Close()
-	ctl.readerShutdown.WaitDown()
+	ctl.readerShutdown.WaitDone()
+
+	ctl.mu.Lock()
+	defer ctl.mu.Unlock()
 
 	close(ctl.workConnCh)
 	for workConn := range ctl.workConnCh {
@@ -281,6 +298,7 @@ func (ctl *Control) manager() {
 	defer func() {
 		if err := recover(); err != nil {
 			ctl.conn.Error("panic error: %v", err)
+			ctl.conn.Error(string(debug.Stack()))
 		}
 	}()
 
@@ -293,9 +311,9 @@ func (ctl *Control) manager() {
 	for {
 		select {
 		case <-heartbeat.C:
-			if time.Since(ctl.lastPing) > time.Duration(config.ServerCommonCfg.HeartBeatTimeout)*time.Second {
+			if time.Since(ctl.lastPing) > time.Duration(g.GlbServerCfg.HeartBeatTimeout)*time.Second {
 				ctl.conn.Warn("heartbeat timeout")
-				ctl.allShutdown.Start()
+				return
 			}
 		case rawMsg, ok := <-ctl.readCh:
 			if !ok {
@@ -305,7 +323,7 @@ func (ctl *Control) manager() {
 			switch m := rawMsg.(type) {
 			case *msg.NewProxy:
 				// register proxy in this control
-				err := ctl.RegisterProxy(m)
+				remoteAddr, err := ctl.RegisterProxy(m)
 				resp := &msg.NewProxyResp{
 					ProxyName: m.ProxyName,
 				}
@@ -313,10 +331,14 @@ func (ctl *Control) manager() {
 					resp.Error = err.Error()
 					ctl.conn.Warn("new proxy [%s] error: %v", m.ProxyName, err)
 				} else {
+					resp.RemoteAddr = remoteAddr
 					ctl.conn.Info("new proxy [%s] success", m.ProxyName)
 					StatsNewProxy(m.ProxyName, m.ProxyType)
 				}
 				ctl.sendCh <- resp
+			case *msg.CloseProxy:
+				ctl.CloseProxy(m)
+				ctl.conn.Info("close proxy [%s] success", m.ProxyName)
 			case *msg.Ping:
 				ctl.lastPing = time.Now()
 				ctl.conn.Debug("receive heartbeat")
@@ -326,24 +348,44 @@ func (ctl *Control) manager() {
 	}
 }
 
-func (ctl *Control) RegisterProxy(pxyMsg *msg.NewProxy) (err error) {
+func (ctl *Control) RegisterProxy(pxyMsg *msg.NewProxy) (remoteAddr string, err error) {
 	var pxyConf config.ProxyConf
 	// Load configures from NewProxy message and check.
-	pxyConf, err = config.NewProxyConf(pxyMsg)
+	pxyConf, err = config.NewProxyConfFromMsg(pxyMsg)
 	if err != nil {
-		return err
+		return
 	}
 
 	// NewProxy will return a interface Proxy.
 	// In fact it create different proxies by different proxy type, we just call run() here.
 	pxy, err := NewProxy(ctl, pxyConf)
 	if err != nil {
-		return err
+		return remoteAddr, err
 	}
 
-	err = pxy.Run()
+	// Check ports used number in each client
+	if g.GlbServerCfg.MaxPortsPerClient > 0 {
+		ctl.mu.Lock()
+		if ctl.portsUsedNum+pxy.GetUsedPortsNum() > int(g.GlbServerCfg.MaxPortsPerClient) {
+			ctl.mu.Unlock()
+			err = fmt.Errorf("exceed the max_ports_per_client")
+			return
+		}
+		ctl.portsUsedNum = ctl.portsUsedNum + pxy.GetUsedPortsNum()
+		ctl.mu.Unlock()
+
+		defer func() {
+			if err != nil {
+				ctl.mu.Lock()
+				ctl.portsUsedNum = ctl.portsUsedNum - pxy.GetUsedPortsNum()
+				ctl.mu.Unlock()
+			}
+		}()
+	}
+
+	remoteAddr, err = pxy.Run()
 	if err != nil {
-		return err
+		return
 	}
 	defer func() {
 		if err != nil {
@@ -353,8 +395,32 @@ func (ctl *Control) RegisterProxy(pxyMsg *msg.NewProxy) (err error) {
 
 	err = ctl.svr.RegisterProxy(pxyMsg.ProxyName, pxy)
 	if err != nil {
-		return err
+		return
 	}
-	ctl.proxies = append(ctl.proxies, pxy)
-	return nil
+
+	ctl.mu.Lock()
+	ctl.proxies[pxy.GetName()] = pxy
+	ctl.mu.Unlock()
+	return
+}
+
+func (ctl *Control) CloseProxy(closeMsg *msg.CloseProxy) (err error) {
+	ctl.mu.Lock()
+
+	pxy, ok := ctl.proxies[closeMsg.ProxyName]
+	if !ok {
+		ctl.mu.Unlock()
+		return
+	}
+
+	if g.GlbServerCfg.MaxPortsPerClient > 0 {
+		ctl.portsUsedNum = ctl.portsUsedNum - pxy.GetUsedPortsNum()
+	}
+	pxy.Close()
+	ctl.svr.DelProxy(pxy.GetName())
+	delete(ctl.proxies, closeMsg.ProxyName)
+	ctl.mu.Unlock()
+
+	StatsCloseProxy(pxy.GetName(), pxy.GetConf().GetBaseInfo().ProxyType)
+	return
 }

@@ -13,15 +13,15 @@
 package vhost
 
 import (
-	"bytes"
 	"fmt"
-	"io"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/fatedier/frp/utils/log"
 	frpNet "github.com/fatedier/frp/utils/net"
+
+	"github.com/fatedier/golib/errors"
 )
 
 type muxFunc func(frpNet.Conn) (frpNet.Conn, map[string]string, error)
@@ -51,12 +51,17 @@ func NewVhostMuxer(listener frpNet.Listener, vhostFunc muxFunc, authFunc httpAut
 	return mux, nil
 }
 
+type CreateConnFunc func() (frpNet.Conn, error)
+
 type VhostRouteConfig struct {
 	Domain      string
 	Location    string
 	RewriteHost string
 	Username    string
 	Password    string
+	Headers     map[string]string
+
+	CreateConnFn CreateConnFunc
 }
 
 // listen for a new domain name, if rewriteHost is not empty  and rewriteFunc is not nil
@@ -92,7 +97,7 @@ func (v *VhostMuxer) getListener(name, path string) (l *Listener, exist bool) {
 	// if not exist, then check the wildcard_domain such as *.example.com
 	vr, found := v.registryRouter.Get(name, path)
 	if found {
-		return vr.listener, true
+		return vr.payload.(*Listener), true
 	}
 
 	domainSplit := strings.Split(name, ".")
@@ -107,7 +112,7 @@ func (v *VhostMuxer) getListener(name, path string) (l *Listener, exist bool) {
 		return
 	}
 
-	return vr.listener, true
+	return vr.payload.(*Listener), true
 }
 
 func (v *VhostMuxer) run() {
@@ -128,7 +133,7 @@ func (v *VhostMuxer) handle(c frpNet.Conn) {
 
 	sConn, reqInfoMap, err := v.vhostFunc(c)
 	if err != nil {
-		log.Error("get hostname from http/https request error: %v", err)
+		log.Warn("get hostname from http/https request error: %v", err)
 		c.Close()
 		return
 	}
@@ -137,17 +142,19 @@ func (v *VhostMuxer) handle(c frpNet.Conn) {
 	path := strings.ToLower(reqInfoMap["Path"])
 	l, ok := v.getListener(name, path)
 	if !ok {
+		res := notFoundResponse()
+		res.Write(c)
 		log.Debug("http request for host [%s] path [%s] not found", name, path)
 		c.Close()
 		return
 	}
 
 	// if authFunc is exist and userName/password is set
-	// verify user access
+	// then verify user access
 	if l.mux.authFunc != nil && l.userName != "" && l.passWord != "" {
 		bAccess, err := l.mux.authFunc(c, l.userName, l.passWord, reqInfoMap["Authorization"])
 		if bAccess == false || err != nil {
-			l.Debug("check Authorization failed")
+			l.Debug("check http Authorization failed")
 			res := noAuthResponse()
 			res.Write(c)
 			c.Close()
@@ -162,7 +169,12 @@ func (v *VhostMuxer) handle(c frpNet.Conn) {
 	c = sConn
 
 	l.Debug("get new http request host [%s] path [%s]", name, path)
-	l.accept <- c
+	err = errors.PanicToError(func() {
+		l.accept <- c
+	})
+	if err != nil {
+		l.Warn("listener is already closed, ignore this request")
+	}
 }
 
 type Listener struct {
@@ -182,9 +194,10 @@ func (l *Listener) Accept() (frpNet.Conn, error) {
 		return nil, fmt.Errorf("Listener closed")
 	}
 
-	// if rewriteFunc is exist and rewriteHost is set
+	// if rewriteFunc is exist
 	// rewrite http requests with a modified host header
-	if l.mux.rewriteFunc != nil && l.rewriteHost != "" {
+	// if l.rewriteHost is empty, nothing to do
+	if l.mux.rewriteFunc != nil {
 		sConn, err := l.mux.rewriteFunc(conn, l.rewriteHost)
 		if err != nil {
 			l.Warn("host header rewrite failed: %v", err)
@@ -208,46 +221,4 @@ func (l *Listener) Close() error {
 
 func (l *Listener) Name() string {
 	return l.name
-}
-
-type sharedConn struct {
-	frpNet.Conn
-	sync.Mutex
-	buff *bytes.Buffer
-}
-
-// the bytes you read in io.Reader, will be reserved in sharedConn
-func newShareConn(conn frpNet.Conn) (*sharedConn, io.Reader) {
-	sc := &sharedConn{
-		Conn: conn,
-		buff: bytes.NewBuffer(make([]byte, 0, 1024)),
-	}
-	return sc, io.TeeReader(conn, sc.buff)
-}
-
-func (sc *sharedConn) Read(p []byte) (n int, err error) {
-	sc.Lock()
-	if sc.buff == nil {
-		sc.Unlock()
-		return sc.Conn.Read(p)
-	}
-	sc.Unlock()
-	n, err = sc.buff.Read(p)
-
-	if err == io.EOF {
-		sc.Lock()
-		sc.buff = nil
-		sc.Unlock()
-		var n2 int
-		n2, err = sc.Conn.Read(p[n:])
-
-		n += n2
-	}
-	return
-}
-
-func (sc *sharedConn) WriteBuff(buffer []byte) (err error) {
-	sc.buff.Reset()
-	_, err = sc.buff.Write(buffer)
-	return err
 }

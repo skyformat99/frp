@@ -15,64 +15,23 @@
 package plugin
 
 import (
+	"bufio"
 	"encoding/base64"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"strings"
-	"sync"
 
-	"github.com/fatedier/frp/models/proto/tcp"
-	"github.com/fatedier/frp/utils/errors"
 	frpNet "github.com/fatedier/frp/utils/net"
+
+	frpIo "github.com/fatedier/golib/io"
+	gnet "github.com/fatedier/golib/net"
 )
 
 const PluginHttpProxy = "http_proxy"
 
 func init() {
 	Register(PluginHttpProxy, NewHttpProxyPlugin)
-}
-
-type Listener struct {
-	conns  chan net.Conn
-	closed bool
-	mu     sync.Mutex
-}
-
-func NewProxyListener() *Listener {
-	return &Listener{
-		conns: make(chan net.Conn, 64),
-	}
-}
-
-func (l *Listener) Accept() (net.Conn, error) {
-	conn, ok := <-l.conns
-	if !ok {
-		return nil, fmt.Errorf("listener closed")
-	}
-	return conn, nil
-}
-
-func (l *Listener) PutConn(conn net.Conn) error {
-	err := errors.PanicToError(func() {
-		l.conns <- conn
-	})
-	return err
-}
-
-func (l *Listener) Close() error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if !l.closed {
-		close(l.conns)
-		l.closed = true
-	}
-	return nil
-}
-
-func (l *Listener) Addr() net.Addr {
-	return (*net.TCPAddr)(nil)
 }
 
 type HttpProxy struct {
@@ -105,15 +64,29 @@ func (hp *HttpProxy) Name() string {
 	return PluginHttpProxy
 }
 
-func (hp *HttpProxy) Handle(conn io.ReadWriteCloser) {
-	var wrapConn net.Conn
-	if realConn, ok := conn.(net.Conn); ok {
-		wrapConn = realConn
-	} else {
-		wrapConn = frpNet.WrapReadWriteCloserToConn(conn)
+func (hp *HttpProxy) Handle(conn io.ReadWriteCloser, realConn frpNet.Conn) {
+	wrapConn := frpNet.WrapReadWriteCloserToConn(conn, realConn)
+
+	sc, rd := gnet.NewSharedConn(wrapConn)
+	firstBytes := make([]byte, 7)
+	_, err := rd.Read(firstBytes)
+	if err != nil {
+		wrapConn.Close()
+		return
 	}
 
-	hp.l.PutConn(wrapConn)
+	if strings.ToUpper(string(firstBytes)) == "CONNECT" {
+		bufRd := bufio.NewReader(sc)
+		request, err := http.ReadRequest(bufRd)
+		if err != nil {
+			wrapConn.Close()
+			return
+		}
+		hp.handleConnectReq(request, frpIo.WrapReadWriteCloser(bufRd, wrapConn, wrapConn.Close))
+		return
+	}
+
+	hp.l.PutConn(sc)
 	return
 }
 
@@ -124,13 +97,15 @@ func (hp *HttpProxy) Close() error {
 }
 
 func (hp *HttpProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
-	if ok := hp.Auth(rw, req); !ok {
+	if ok := hp.Auth(req); !ok {
 		rw.Header().Set("Proxy-Authenticate", "Basic")
 		rw.WriteHeader(http.StatusProxyAuthRequired)
 		return
 	}
 
-	if req.Method == "CONNECT" {
+	if req.Method == http.MethodConnect {
+		// deprecated
+		// Connect request is handled in Handle function.
 		hp.ConnectHandler(rw, req)
 	} else {
 		hp.HttpHandler(rw, req)
@@ -156,6 +131,9 @@ func (hp *HttpProxy) HttpHandler(rw http.ResponseWriter, req *http.Request) {
 	}
 }
 
+// deprecated
+// Hijack needs to SetReadDeadline on the Conn of the request, but if we use stream compression here,
+// we may always get i/o timeout error.
 func (hp *HttpProxy) ConnectHandler(rw http.ResponseWriter, req *http.Request) {
 	hj, ok := rw.(http.Hijacker)
 	if !ok {
@@ -175,12 +153,12 @@ func (hp *HttpProxy) ConnectHandler(rw http.ResponseWriter, req *http.Request) {
 		client.Close()
 		return
 	}
-	client.Write([]byte("HTTP/1.0 200 OK\r\n\r\n"))
+	client.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
 
-	go tcp.Join(remote, client)
+	go frpIo.Join(remote, client)
 }
 
-func (hp *HttpProxy) Auth(rw http.ResponseWriter, req *http.Request) bool {
+func (hp *HttpProxy) Auth(req *http.Request) bool {
 	if hp.AuthUser == "" && hp.AuthPasswd == "" {
 		return true
 	}
@@ -206,6 +184,30 @@ func (hp *HttpProxy) Auth(rw http.ResponseWriter, req *http.Request) bool {
 	return true
 }
 
+func (hp *HttpProxy) handleConnectReq(req *http.Request, rwc io.ReadWriteCloser) {
+	defer rwc.Close()
+	if ok := hp.Auth(req); !ok {
+		res := getBadResponse()
+		res.Write(rwc)
+		return
+	}
+
+	remote, err := net.Dial("tcp", req.URL.Host)
+	if err != nil {
+		res := &http.Response{
+			StatusCode: 400,
+			Proto:      "HTTP/1.1",
+			ProtoMajor: 1,
+			ProtoMinor: 1,
+		}
+		res.Write(rwc)
+		return
+	}
+	rwc.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
+
+	frpIo.Join(remote, rwc)
+}
+
 func copyHeaders(dst, src http.Header) {
 	for key, values := range src {
 		for _, value := range values {
@@ -224,4 +226,18 @@ func removeProxyHeaders(req *http.Request) {
 	req.Header.Del("Trailers")
 	req.Header.Del("Transfer-Encoding")
 	req.Header.Del("Upgrade")
+}
+
+func getBadResponse() *http.Response {
+	header := make(map[string][]string)
+	header["Proxy-Authenticate"] = []string{"Basic"}
+	res := &http.Response{
+		Status:     "407 Not authorized",
+		StatusCode: 407,
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header:     header,
+	}
+	return res
 }

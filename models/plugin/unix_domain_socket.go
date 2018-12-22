@@ -19,7 +19,9 @@ import (
 	"io"
 	"net"
 
-	"github.com/fatedier/frp/models/proto/tcp"
+	frpNet "github.com/fatedier/frp/utils/net"
+
+	frpIo "github.com/fatedier/golib/io"
 )
 
 const PluginUnixDomainSocket = "unix_domain_socket"
@@ -51,13 +53,13 @@ func NewUnixDomainSocketPlugin(params map[string]string) (p Plugin, err error) {
 	return
 }
 
-func (uds *UnixDomainSocketPlugin) Handle(conn io.ReadWriteCloser) {
+func (uds *UnixDomainSocketPlugin) Handle(conn io.ReadWriteCloser, realConn frpNet.Conn) {
 	localConn, err := net.DialUnix("unix", nil, uds.UnixAddr)
 	if err != nil {
 		return
 	}
 
-	tcp.Join(localConn, conn)
+	frpIo.Join(localConn, conn)
 }
 
 func (uds *UnixDomainSocketPlugin) Name() string {
